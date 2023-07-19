@@ -1,8 +1,8 @@
 use crate::{
     action::{
-        base::{CreateDirectory, RemoveDirectory},
+        base::{CreateDirectory, CreateFile, RemoveDirectory},
         common::{ConfigureInitService, ConfigureNix, CreateUsersAndGroups, ProvisionNix},
-        linux::ProvisionSelinux,
+        linux::{ProvisionSelinux, StartSystemdUnit, SystemctlDaemonReload},
         StatefulAction,
     },
     error::HasExpectedErrors,
@@ -11,7 +11,10 @@ use crate::{
     settings::{InitSettings, InitSystem, InstallSettingsError},
     Action, BuiltinPlanner,
 };
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 use tokio::process::Command;
 use which::which;
 
@@ -39,11 +42,129 @@ impl Planner for Linux {
 
     async fn plan(&self) -> Result<Vec<StatefulAction<Box<dyn Action>>>, PlannerError> {
         let has_selinux = detect_selinux().await?;
+        let mut plan = vec![
+            // Primarily for uninstall
+            SystemctlDaemonReload::plan()
+                .await
+                .map_err(PlannerError::Action)?
+                .boxed(),
+        ];
 
-        let mut plan = vec![];
+        let persistence = PathBuf::from("/var/home/nix");
+        plan.push(
+            CreateDirectory::plan(&persistence, None, None, 0o0755, true)
+                .await
+                .map_err(PlannerError::Action)?
+                .boxed(),
+        );
+
+        let nix_directory_buf = "\
+                [Unit]\n\
+                Description=Enable mount points in / for ostree\n\
+                ConditionPathExists=!/nix\n\
+                DefaultDependencies=no\n\
+                Requires=local-fs-pre.target\n\
+                After=local-fs-pre.target\n\
+                [Service]\n\
+                Type=oneshot\n\
+                ExecStartPre=chattr -i /\n\
+                ExecStart=mkdir -p /nix\n\
+                ExecStopPost=chattr +i /\n\
+            "
+        .to_string();
+        let nix_directory_unit = CreateFile::plan(
+            "/etc/systemd/system/nix-directory.service",
+            None,
+            None,
+            0o0644,
+            nix_directory_buf,
+            false,
+        )
+        .await
+        .map_err(PlannerError::Action)?;
+        plan.push(nix_directory_unit.boxed());
+
+        let create_bind_mount_buf = format!(
+            "\
+                [Unit]\n\
+                Description=Mount `{persistence}` on `/nix`\n\
+                PropagatesStopTo=nix-daemon.service\n\
+                PropagatesStopTo=nix-directory.service\n\
+                After=nix-directory.service\n\
+                Requires=nix-directory.service\n\
+                ConditionPathIsDirectory=/nix\n\
+                DefaultDependencies=no\n\
+                \n\
+                [Mount]\n\
+                What={persistence}\n\
+                Where=/nix\n\
+                Type=none\n\
+                DirectoryMode=0755\n\
+                Options=bind\n\
+                \n\
+                [Install]\n\
+                RequiredBy=nix-daemon.service\n\
+                RequiredBy=nix-daemon.socket\n
+            ",
+            persistence = persistence.display(),
+        );
+        let create_bind_mount_unit = CreateFile::plan(
+            "/etc/systemd/system/nix.mount",
+            None,
+            None,
+            0o0644,
+            create_bind_mount_buf,
+            false,
+        )
+        .await
+        .map_err(PlannerError::Action)?;
+        plan.push(create_bind_mount_unit.boxed());
+
+        let ensure_symlinked_units_resolve_buf = "\
+        [Unit]\n\
+        Description=Ensure Nix related units which are symlinked resolve\n\
+        After=nix.mount\n\
+        Requires=nix.mount\n\
+        DefaultDependencies=no\n\
+        \n\
+        [Service]\n\
+        Type=oneshot\n\
+        RemainAfterExit=yes\n\
+        ExecStart=/usr/bin/systemctl daemon-reload\n\
+        ExecStart=/usr/bin/systemctl restart --no-block nix-daemon.socket\n\
+        \n\
+        [Install]\n\
+        WantedBy=sysinit.target\n\
+    "
+        .to_string();
+        let ensure_symlinked_units_resolve_unit = CreateFile::plan(
+            "/etc/systemd/system/ensure-symlinked-units-resolve.service",
+            None,
+            None,
+            0o0644,
+            ensure_symlinked_units_resolve_buf,
+            false,
+        )
+        .await
+        .map_err(PlannerError::Action)?;
+        plan.push(ensure_symlinked_units_resolve_unit.boxed());
+
+        // We need to remove this path since it's part of the read-only install.
+        let mut shell_profile_locations = ShellProfileLocations::default();
+        if let Some(index) = shell_profile_locations
+            .fish
+            .vendor_confd_prefixes
+            .iter()
+            .position(|v| *v == PathBuf::from("/usr/share/fish/"))
+        {
+            shell_profile_locations
+                .fish
+                .vendor_confd_prefixes
+                .remove(index);
+        }
 
         plan.push(
-            CreateDirectory::plan("/nix", None, None, 0o0755, true)
+            StartSystemdUnit::plan("nix.mount".to_string(), false)
                 .await
                 .map_err(PlannerError::Action)?
                 .boxed(),
@@ -62,7 +183,7 @@ impl Planner for Linux {
                 .boxed(),
         );
         plan.push(
-            ConfigureNix::plan(ShellProfileLocations::default(), &self.settings)
+            ConfigureNix::plan(shell_profile_locations, &self.settings)
                 .await
                 .map_err(PlannerError::Action)?
                 .boxed(),
@@ -70,7 +191,7 @@ impl Planner for Linux {
 
         if has_selinux {
             plan.push(
-                ProvisionSelinux::plan("/usr/share/selinux/packages/nix.pp".into())
+                ProvisionSelinux::plan("/etc/nix-installer/selinux/packages/nix.pp".into())
                     .await
                     .map_err(PlannerError::Action)?
                     .boxed(),
@@ -84,7 +205,19 @@ impl Planner for Linux {
                 .boxed(),
         );
         plan.push(
+            StartSystemdUnit::plan("ensure-symlinked-units-resolve.service".to_string(), true)
+                .await
+                .map_err(PlannerError::Action)?
+                .boxed(),
+        );
+        plan.push(
             RemoveDirectory::plan(crate::settings::SCRATCH_DIR)
+                .await
+                .map_err(PlannerError::Action)?
+                .boxed(),
+        );
+        plan.push(
+            SystemctlDaemonReload::plan()
                 .await
                 .map_err(PlannerError::Action)?
                 .boxed(),
